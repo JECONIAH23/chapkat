@@ -1,32 +1,143 @@
 import 'dart:async';
+import 'dart:convert';
 import 'dart:io';
 import 'package:flutter/material.dart';
 import 'package:flutter_sound/flutter_sound.dart';
 import 'package:http/http.dart' as http;
 import 'package:path_provider/path_provider.dart';
 import 'package:permission_handler/permission_handler.dart';
-import 'package:shared_preferences/shared_preferences.dart';
+import 'package:sqflite/sqflite.dart';
+import 'package:path/path.dart';
+import 'package:connectivity_plus/connectivity_plus.dart';
+import 'package:workmanager/workmanager.dart';
 import 'package:flutter_tts/flutter_tts.dart';
-import 'dart:convert';
-import 'auth/auth_service.dart';
 
-class MyHomePage extends StatefulWidget {
-  final AuthService authService;
-  final VoidCallback onLogout;
-  final String title;
+// Database setup
+late Database _database;
 
-  const MyHomePage({
-    super.key,
-    required this.title,
-    required this.authService,
-    required this.onLogout,
-  });
-
-  @override
-  State<MyHomePage> createState() => _MyHomePageState();
+Future<void> initDatabase() async {
+  _database = await openDatabase(
+    join(await getDatabasesPath(), 'voice_records.db'),
+    onCreate: (db, version) {
+      return db.execute('''
+        CREATE TABLE recordings(
+          id INTEGER PRIMARY KEY AUTOINCREMENT,
+          file_path TEXT,
+          language TEXT,
+          status TEXT,
+          transcript TEXT,
+          created_at TEXT,
+          uploaded_at TEXT
+        )
+        ''');
+    },
+    version: 1,
+  );
 }
 
-class _MyHomePageState extends State<MyHomePage>
+void callbackDispatcher() {
+  Workmanager().executeTask((task, inputData) async {
+    await _syncPendingRecordings();
+    return true;
+  });
+}
+
+Future<void> _syncPendingRecordings() async {
+  final pending = await _database.query(
+    'recordings',
+    where: 'status = ?',
+    whereArgs: ['pending'],
+  );
+
+  for (final record in pending) {
+    try {
+      final file = File(record['file_path'] as String);
+      if (await file.exists()) {
+        final request = http.MultipartRequest(
+          'POST',
+          Uri.parse(
+            'https://2e0e-41-210-154-141.ngrok-free.app/api/voicebook/api/audio/',
+          ),
+        );
+
+        request.files.add(
+          await http.MultipartFile.fromPath('audio_file', file.path),
+        );
+        request.fields['language'] = record['language'] as String;
+
+        final response = await http.Response.fromStream(await request.send());
+
+        if (response.statusCode == 200) {
+          final jsonResponse = json.decode(response.body);
+          await _database.update(
+            'recordings',
+            {
+              'status': 'uploaded',
+              'uploaded_at': DateTime.now().toIso8601String(),
+              'transcript': jsonResponse['transcription'] ?? '',
+            },
+            where: 'id = ?',
+            whereArgs: [record['id']],
+          );
+        }
+      }
+    } catch (e) {
+      debugPrint('Sync error: $e');
+    }
+  }
+}
+
+// Future<void> _syncPendingRecordings() async {
+//   final pending = await _database.query(
+//     'recordings',
+//     where: 'status = ?',
+//     whereArgs: ['pending'],
+//   );
+
+//   for (final record in pending) {
+//     try {
+//       final file = File(record['file_path'] as String);
+//       if (await file.exists()) {
+//         final bytes = await file.readAsBytes();
+
+//         final response = await http.post(
+//           Uri.parse(
+//             ' https://2e0e-41-210-154-141.ngrok-free.app/api/voicebook/api/audio/',
+//           ),
+//           body: {
+//             'audio': base64Encode(bytes),
+//             'language': record['language'] as String,
+//           },
+//         );
+
+//         if (response.statusCode == 200) {
+//           await _database.update(
+//             'recordings',
+//             {
+//               'status': 'uploaded',
+//               'uploaded_at': DateTime.now().toIso8601String(),
+//               'transcript': response.body,
+//             },
+//             where: 'id = ?',
+//             whereArgs: [record['id']],
+//           );
+//         }
+//       }
+//     } catch (e) {
+//       debugPrint('Sync error: $e');
+//     }
+//   }
+// }
+
+class HomePage extends StatefulWidget {
+  final String title;
+  const HomePage({super.key, required this.title});
+
+  @override
+  State<HomePage> createState() => _HomePageState();
+}
+
+class _HomePageState extends State<HomePage>
     with SingleTickerProviderStateMixin {
   final FlutterSoundRecorder _recorder = FlutterSoundRecorder();
   final FlutterSoundPlayer _player = FlutterSoundPlayer();
@@ -38,9 +149,6 @@ class _MyHomePageState extends State<MyHomePage>
   String _status = 'Initializing...';
   String? _filePath;
   late AnimationController _animationController;
-  final List<ChatMessage> _messages = [];
-  final ScrollController _scrollController = ScrollController();
-  bool _showSidebar = false;
   double _recordingDuration = 0;
   Timer? _recordingTimer;
   String _selectedLanguage = 'lug';
@@ -51,48 +159,54 @@ class _MyHomePageState extends State<MyHomePage>
     {'code': 'ach', 'name': 'Acholi'},
     {'code': 'teo', 'name': 'Ateso'},
   ];
+  List<Map<String, dynamic>> _recordings = [];
+  bool _showHistory = false;
 
   @override
   void initState() {
     super.initState();
     _initRecorder();
     _initPlayer();
-    _loadMessages();
     _initTts();
+    _loadRecordings();
     _animationController = AnimationController(
       vsync: this,
       duration: const Duration(milliseconds: 1000),
     );
-    debugPrint('Initializing MyHomePage');
+
+    // Setup background sync
+    Workmanager().initialize(callbackDispatcher);
+    Workmanager().registerPeriodicTask(
+      "syncTask",
+      "syncRecordings",
+      frequency: const Duration(minutes: 15),
+    );
+
+    // Check connectivity on startup
+    _checkConnectivity();
   }
 
-  @override
-  void dispose() {
-    _recordingTimer?.cancel();
-    _animationController.dispose();
-    _scrollController.dispose();
-    if (_recorder.isRecording) {
-      _recorder.stopRecorder().then((_) => _recorder.closeRecorder());
-    } else {
-      _recorder.closeRecorder();
+  Future<void> _checkConnectivity() async {
+    final connectivity = await Connectivity().checkConnectivity();
+    if (connectivity != ConnectivityResult.none) {
+      await _syncPendingRecordings();
+      _loadRecordings(); // Refresh list after sync
     }
-    if (_player.isPlaying) {
-      _player.stopPlayer().then((_) => _player.closePlayer());
-    } else {
-      _player.closePlayer();
-    }
-    _tts.stop();
-    super.dispose();
+  }
+
+  Future<void> _loadRecordings() async {
+    final records = await _database.query(
+      'recordings',
+      orderBy: 'created_at DESC',
+    );
+    setState(() => _recordings = records);
   }
 
   Future<void> _initRecorder() async {
     try {
-      final micStatus = await Permission.microphone.request();
-      if (!micStatus.isGranted) {
-        setState(() {
-          _status = 'Microphone permission denied';
-          _isRecorderReady = false;
-        });
+      final status = await Permission.microphone.request();
+      if (!status.isGranted) {
+        setState(() => _status = 'Microphone permission denied');
         return;
       }
 
@@ -101,383 +215,210 @@ class _MyHomePageState extends State<MyHomePage>
         _isRecorderReady = true;
         _status = 'Ready to record';
       });
-      await _cleanupOldRecordings();
     } catch (e) {
-      setState(() {
-        _status = 'Failed to initialize recorder: $e';
-        _isRecorderReady = false;
-      });
-      debugPrint('Recorder initialization error: $e');
+      setState(() => _status = 'Recorder init failed: $e');
     }
   }
 
+  // Future<void> _initPlayer() async {
+  //   try {
+  //     await _player.openPlayer();
+  //     setState(() => _isPlayerReady = true);
+  //   } catch (e) {
+  //     debugPrint('Player init error: $e');
+  //   }
+  // }
   Future<void> _initPlayer() async {
     try {
       await _player.openPlayer();
-      setState(() {
-        _isPlayerReady = true;
-      });
+      setState(() => _isPlayerReady = true);
     } catch (e) {
-      setState(() {
-        _isPlayerReady = false;
-      });
-      debugPrint('Player initialization error: $e');
+      debugPrint('Player init error: $e');
+      setState(() => _isPlayerReady = false);
     }
   }
 
   Future<void> _initTts() async {
     try {
-      await _tts.setLanguage('en-US'); // Fallback language
+      await _tts.setLanguage('en-US');
       await _tts.setSpeechRate(0.5);
-      await _tts.setVolume(0.0);
-      await _tts.setPitch(0.0);
     } catch (e) {
-      debugPrint('TTS initialization error: $e');
-    }
-  }
-
-  Future<void> _cleanupOldRecordings() async {
-    try {
-      final directory = await getApplicationDocumentsDirectory();
-      final files = directory.listSync();
-      for (final file in files) {
-        if (file.path.endsWith('.aac') || file.path.endsWith('.wav')) {
-          if (file is File) {
-            await file.delete();
-          }
-        }
-      }
-    } catch (e) {
-      debugPrint('Error cleaning up old recordings: $e');
-    }
-  }
-
-  Future<void> _loadMessages() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final messagesJson = prefs.getString('messages');
-      if (messagesJson != null) {
-        final List<dynamic> decoded = json.decode(messagesJson);
-        setState(() {
-          _messages.clear();
-          _messages.addAll(
-            decoded.map(
-              (m) => ChatMessage(
-                text: m['text'],
-                isResponse: m['isResponse'],
-                timestamp: DateTime.parse(m['timestamp']),
-              ),
-            ),
-          );
-        });
-        WidgetsBinding.instance.addPostFrameCallback((_) {
-          _scrollController.jumpTo(_scrollController.position.maxScrollExtent);
-        });
-      }
-    } catch (e) {
-      debugPrint('Error loading messages: $e');
-    }
-  }
-
-  Future<void> _saveMessages() async {
-    try {
-      final prefs = await SharedPreferences.getInstance();
-      final messagesJson = _messages
-          .map(
-            (m) => {
-              'text': m.text,
-              'isResponse': m.isResponse,
-              'timestamp': m.timestamp.toIso8601String(),
-            },
-          )
-          .toList();
-      await prefs.setString('messages', json.encode(messagesJson));
-    } catch (e) {
-      debugPrint('Error saving messages: $e');
+      debugPrint('TTS init error: $e');
     }
   }
 
   void _startRecordingTimer() {
     _recordingDuration = 0;
     _recordingTimer = Timer.periodic(const Duration(seconds: 1), (timer) {
-      setState(() {
-        _recordingDuration++;
-      });
+      setState(() => _recordingDuration++);
     });
   }
 
   Future<void> _startRecording() async {
-    if (!_isRecorderReady) {
-      await _initRecorder();
-      if (!_isRecorderReady) return;
-    }
+    if (!_isRecorderReady) return;
 
     try {
       final directory = await getApplicationDocumentsDirectory();
       _filePath =
           '${directory.path}/recording_${DateTime.now().millisecondsSinceEpoch}.aac';
+
       await _recorder.startRecorder(toFile: _filePath, codec: Codec.aacADTS);
       setState(() {
         _isRecording = true;
         _status = 'Recording...';
-        _recordingDuration = 0;
       });
       _animationController.repeat(reverse: true);
       _startRecordingTimer();
     } catch (e) {
-      _recordingTimer?.cancel();
-      setState(() {
-        _status = 'Error starting recording: $e';
-      });
-      debugPrint('Recording start error: $e');
+      setState(() => _status = 'Recording error: $e');
     }
   }
 
   Future<void> _stopRecording() async {
+    _recordingTimer?.cancel();
+    _animationController.stop();
+
     try {
-      _recordingTimer?.cancel();
-      _animationController.stop();
       await _recorder.stopRecorder();
       setState(() {
         _isRecording = false;
-        _status = 'Ready to record';
+        _status = 'Recording saved';
       });
-      _addMessage('Recording saved (${_recordingDuration}s)', false);
+      await _saveRecording();
     } catch (e) {
-      _recordingTimer?.cancel();
-      setState(() {
-        _status = 'Error stopping recording: $e';
-      });
-      debugPrint('Recording stop error: $e');
+      setState(() => _status = 'Stop recording error: $e');
     }
   }
 
-  Future<void> _sendRecording() async {
+  Future<void> _saveRecording() async {
     if (_filePath == null) return;
 
-    setState(() {
-      _status = 'Sending recording...';
-      _addMessage('Sending recording...', false);
+    await _database.insert('recordings', {
+      'file_path': _filePath,
+      'language': _selectedLanguage,
+      'status': 'pending',
+      'transcript': '',
+      'created_at': DateTime.now().toIso8601String(),
+      'uploaded_at': null,
     });
 
-    showDialog(
-      context: context,
-      barrierDismissible: false,
-      builder: (context) => const Center(child: CircularProgressIndicator()),
-    );
+    _loadRecordings(); // Refresh list
+    await _checkConnectivity(); // Try to sync immediately
+  }
+
+  // Future<void> _playRecording(String filePath) async {
+  //   try {
+  //     await _player.startPlayer(fromURI: filePath);
+  //   } catch (e) {
+  //     debugPrint('Playback error: $e');
+  //     ScaffoldMessenger.of(context as BuildContext).showSnackBar(
+  //       SnackBar(content: Text('Playback failed: ${e.toString()}')),
+  //     );
+  //   }
+  // }
+  Future<void> _playRecording(String filePath) async {
+    if (!_isPlayerReady) {
+      ScaffoldMessenger.of(
+        context as BuildContext,
+      ).showSnackBar(const SnackBar(content: Text('Player is not ready yet')));
+      return;
+    }
 
     try {
-      final responseBody = await _uploadRecording(
-        widget.authService.accessToken,
-      );
-      Navigator.pop(context);
-      setState(() {
-        _status = 'Recording processed successfully';
-        _addMessage('Server response: $responseBody', true);
-      });
-      if (_enableTts) {
-        await _convertTextToSpeech(responseBody);
-      }
+      await _player.startPlayer(fromURI: filePath);
     } catch (e) {
-      Navigator.pop(context);
-      setState(() {
-        _status = 'Error sending recording: $e';
-        _addMessage('Error: $e', true);
-      });
-      debugPrint('Error sending recording: $e');
-    }
-  }
-
-  Future<String> _uploadRecording(String? accessToken) async {
-    final file = File(_filePath!);
-    final bytes = await file.readAsBytes();
-    final uri = Uri.parse(
-      'https://chapkat-backend.onrender.com/api/audio-process/',
-      // 'https://bengieantony.pythonanywhere.com/api/audio-process/',
-    );
-    final request = http.MultipartRequest('POST', uri)
-      ..headers['Authorization'] = 'Bearer $accessToken'
-      ..fields['language'] = _selectedLanguage
-      ..files.add(
-        http.MultipartFile.fromBytes('audio', bytes, filename: 'recording.aac'),
+      debugPrint('Playback error: $e');
+      ScaffoldMessenger.of(context as BuildContext).showSnackBar(
+        SnackBar(content: Text('Playback failed: ${e.toString()}')),
       );
-
-    final response = await request.send();
-    final responseBody = await response.stream.bytesToString();
-
-    if (response.statusCode == 200) {
-      return responseBody;
-    } else if (response.statusCode == 401) {
-      final refreshed = await widget.authService.refreshAccessToken();
-      if (refreshed && widget.authService.accessToken != null) {
-        final newRequest = http.MultipartRequest('POST', uri)
-          ..headers['Authorization'] =
-              'Bearer ${widget.authService.accessToken}'
-          ..fields['language'] = _selectedLanguage
-          ..files.add(
-            http.MultipartFile.fromBytes(
-              'audio',
-              bytes,
-              filename: 'recording.aac',
-            ),
-          );
-        final newResponse = await newRequest.send();
-        final newResponseBody = await newResponse.stream.bytesToString();
-        if (newResponse.statusCode == 200) {
-          return newResponseBody;
-        } else {
-          _handleErrorResponse(newResponse.statusCode, newResponseBody);
-          throw Exception('Failed to process recording after token refresh');
-        }
-      } else {
-        _handleSessionExpired();
-        throw Exception('Session expired and token refresh failed');
-      }
-    } else {
-      _handleErrorResponse(response.statusCode, responseBody);
-      throw Exception('Failed to process recording');
     }
   }
 
-  Future<void> _convertTextToSpeech(String text) async {
-    setState(() {
-      _status = 'Converting response to speech...';
-      _addMessage('Converting response to speech...', false);
-    });
+  Future<void> _processRecording(String filePath) async {
+    setState(() => _status = 'Processing...');
 
     try {
-      final uri = Uri.parse('https://bengieantony.pythonanywhere.com/api/tts/');
-      final response = await http.post(
-        uri,
-        headers: {
-          'Authorization': 'Bearer ${widget.authService.accessToken}',
-          'Content-Type': 'application/json',
-        },
-        body: json.encode({'text': text, 'language': _selectedLanguage}),
-      );
-
-      if (response.statusCode == 200) {
-        final audioPath = await _saveAudioResponse(response.bodyBytes);
-        setState(() {
-          _status = 'Text-to-speech successful';
-          _addMessage('Response converted to speech', true);
-        });
-        if (_isPlayerReady) {
-          await _player.startPlayer(fromURI: audioPath);
-        } else {
-          throw Exception('Player not initialized');
-        }
-      } else if (response.statusCode == 401) {
-        final refreshed = await widget.authService.refreshAccessToken();
-        if (refreshed && widget.authService.accessToken != null) {
-          final newResponse = await http.post(
-            uri,
-            headers: {
-              'Authorization': 'Bearer ${widget.authService.accessToken}',
-              'Content-Type': 'application/json',
-            },
-            body: json.encode({'text': text, 'language': _selectedLanguage}),
-          );
-          if (newResponse.statusCode == 200) {
-            final audioPath = await _saveAudioResponse(newResponse.bodyBytes);
-            setState(() {
-              _status = 'Text-to-speech successful';
-              _addMessage('Response converted to speech', true);
-            });
-            if (_isPlayerReady) {
-              await _player.startPlayer(fromURI: audioPath);
-            } else {
-              throw Exception('Player not initialized');
-            }
-          } else {
-            _handleErrorResponse(newResponse.statusCode, newResponse.body);
-            throw Exception('TTS failed after token refresh');
-          }
-        } else {
-          _handleSessionExpired();
-          throw Exception('Session expired and token refresh failed');
-        }
-      } else {
-        _handleErrorResponse(response.statusCode, response.body);
-        throw Exception('TTS failed');
-      }
-    } catch (e) {
-      try {
-        await _tts.speak(text);
-        setState(() {
-          _status = 'Text-to-speech successful (fallback)';
-          _addMessage('Response converted to speech (fallback)', true);
-        });
-      } catch (ttsError) {
-        setState(() {
-          _status = 'Error converting text to speech: $ttsError';
-          _addMessage('TTS Error: $ttsError', true);
-        });
-        debugPrint('TTS error: $ttsError');
-      }
-    }
-  }
-
-  Future<String> _saveAudioResponse(List<int> bytes) async {
-    final directory = await getApplicationDocumentsDirectory();
-    final audioPath =
-        '${directory.path}/tts_output_${DateTime.now().millisecondsSinceEpoch}.wav';
-    final file = File(audioPath);
-    await file.writeAsBytes(bytes);
-    return audioPath;
-  }
-
-  void _handleErrorResponse(int statusCode, String responseBody) {
-    setState(() {
-      _status = 'Failed to process request. Status: $statusCode';
-      _addMessage('Error: $statusCode - $responseBody', true);
-    });
-  }
-
-  void _handleSessionExpired() {
-    showDialog(
-      context: context,
-      builder: (context) => AlertDialog(
-        title: const Text('Session Expired'),
-        content: const Text('Your session has expired. Please log in again.'),
-        actions: [
-          TextButton(
-            onPressed: () {
-              Navigator.pop(context);
-              widget.onLogout();
-            },
-            child: const Text('OK'),
-          ),
-        ],
-      ),
-    );
-  }
-
-  void _addMessage(String text, bool isResponse) {
-    setState(() {
-      _messages.add(
-        ChatMessage(
-          text: text,
-          isResponse: isResponse,
-          timestamp: DateTime.now(),
+      final file = File(filePath);
+      final request = http.MultipartRequest(
+        'POST',
+        Uri.parse(
+          'https://2e0e-41-210-154-141.ngrok-free.app/api/voicebook/api/audio/',
         ),
       );
-    });
-    _saveMessages();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      _scrollController.animateTo(
-        _scrollController.position.maxScrollExtent,
-        duration: const Duration(milliseconds: 300),
-        curve: Curves.easeOut,
+
+      request.files.add(
+        await http.MultipartFile.fromPath('audio_file', file.path),
       );
-    });
+      request.fields['language'] = _selectedLanguage;
+
+      final response = await http.Response.fromStream(await request.send());
+
+      if (response.statusCode == 200) {
+        final jsonResponse = json.decode(response.body);
+        final transcription = jsonResponse['transcription'] ?? 'Empty Transcription';
+
+        await _database.update(
+          'recordings',
+          {
+            'status': 'uploaded',
+            'uploaded_at': DateTime.now().toIso8601String(),
+            'transcript': transcription,
+          },
+          where: 'file_path = ?',
+          whereArgs: [filePath],
+        );
+
+        setState(() => _status = 'Processing complete');
+        if (_enableTts && transcription.isNotEmpty) {
+          await _tts.speak(transcription);
+        }
+        _loadRecordings();
+      } else {
+        throw Exception('Server error: ${response.statusCode}');
+      }
+    } catch (e) {
+      setState(() => _status = 'Processing failed');
+      debugPrint('Processing error: $e');
+    }
   }
 
-  void _toggleSidebar() {
-    setState(() {
-      _showSidebar = !_showSidebar;
-    });
-  }
+  // Future<void> _processRecording(String filePath) async {
+  //   setState(() => _status = 'Processing...');
+
+  //   try {
+  //     final file = File(filePath);
+  //     final bytes = await file.readAsBytes();
+
+  //     final response = await http.post(
+  //       Uri.parse('https://your-api-endpoint.com/audio-process'),
+  //       body: {'audio': base64Encode(bytes), 'language': _selectedLanguage},
+  //     );
+
+  //     if (response.statusCode == 200) {
+  //       await _database.update(
+  //         'recordings',
+  //         {
+  //           'status': 'uploaded',
+  //           'uploaded_at': DateTime.now().toIso8601String(),
+  //           'transcript': response.body,
+  //         },
+  //         where: 'file_path = ?',
+  //         whereArgs: [filePath],
+  //       );
+
+  //       setState(() => _status = 'Processing complete');
+  //       if (_enableTts) {
+  //         await _tts.speak(response.body);
+  //       }
+  //       _loadRecordings();
+  //     } else {
+  //       throw Exception('Server error: ${response.statusCode}');
+  //     }
+  //   } catch (e) {
+  //     setState(() => _status = 'Processing failed');
+  //     debugPrint('Processing error: $e');
+  //   }
+  // }
 
   String _formatDuration(double seconds) {
     final duration = Duration(seconds: seconds.toInt());
@@ -485,329 +426,163 @@ class _MyHomePageState extends State<MyHomePage>
   }
 
   @override
-  Widget build(BuildContext context) {
-    final isLargeScreen = MediaQuery.of(context).size.width > 600;
-    final sidebarWidth = isLargeScreen
-        ? 300.0
-        : MediaQuery.of(context).size.width * 0.7;
+  void dispose() {
+    _recordingTimer?.cancel();
+    _animationController.dispose();
+    _recorder.closeRecorder();
+    _player.closePlayer();
+    _tts.stop();
+    _player.closePlayer();
+    setState(() => _isPlayerReady = false); // Add this
+    super.dispose();
+  }
 
+  @override
+  Widget build(BuildContext context) {
     return Scaffold(
       appBar: AppBar(
         title: Text(widget.title),
         actions: [
           IconButton(
-            icon: const Icon(Icons.logout),
-            onPressed: widget.onLogout,
+            icon: const Icon(Icons.history),
+            onPressed: () => setState(() => _showHistory = !_showHistory),
           ),
         ],
       ),
-      body: Stack(
+      body: Column(
         children: [
-          AnimatedPositioned(
-            duration: const Duration(milliseconds: 300),
-            left: _showSidebar ? sidebarWidth : 0,
-            right: _showSidebar ? -sidebarWidth : 0,
-            top: 0,
-            bottom: 0,
-            child: Container(
-              padding: const EdgeInsets.all(16),
+          Expanded(
+            child: _showHistory ? _buildHistoryView() : _buildMainView(),
+          ),
+          _buildControls(),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildMainView() {
+    return Center(
+      child: Column(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          if (_isRecording)
+            ScaleTransition(
+              scale: Tween(begin: 0.8, end: 1.2).animate(
+                CurvedAnimation(
+                  parent: _animationController,
+                  curve: Curves.easeInOut,
+                ),
+              ),
               child: Column(
-                mainAxisAlignment: MainAxisAlignment.center,
                 children: [
-                  Column(
-                    children: [
-                      if (_isRecording)
-                        ScaleTransition(
-                          scale: Tween(begin: 0.8, end: 1.2).animate(
-                            CurvedAnimation(
-                              parent: _animationController,
-                              curve: Curves.easeInOut,
-                            ),
-                          ),
-                          child: Column(
-                            children: [
-                              const Icon(
-                                Icons.mic,
-                                size: 80,
-                                color: Colors.red,
-                              ),
-                              Text(
-                                _formatDuration(_recordingDuration),
-                                style: const TextStyle(
-                                  fontSize: 24,
-                                  fontWeight: FontWeight.bold,
-                                ),
-                              ),
-                            ],
-                          ),
-                        )
-                      else if (_filePath != null)
-                        const Icon(
-                          Icons.audio_file,
-                          size: 80,
-                          color: Colors.blue,
-                        )
-                      else
-                        const Icon(
-                          Icons.mic_none,
-                          size: 80,
-                          color: Colors.grey,
-                        ),
-                      const SizedBox(height: 20),
-                      Text(
-                        _status,
-                        style: const TextStyle(fontSize: 18),
-                        textAlign: TextAlign.center,
-                      ),
-                      Padding(
-                        padding: const EdgeInsets.only(bottom: 16.0),
-                        child: Row(
-                          mainAxisAlignment: MainAxisAlignment.center,
-                          children: [
-                            const Text("Select Language: "),
-                            const SizedBox(width: 10),
-                            DropdownButton<String>(
-                              value: _selectedLanguage,
-                              items: _languages
-                                  .map(
-                                    (lang) => DropdownMenuItem(
-                                      value: lang['code'],
-                                      child: Text(lang['name']!),
-                                    ),
-                                  )
-                                  .toList(),
-                              onChanged: (value) {
-                                if (value != null) {
-                                  setState(() {
-                                    _selectedLanguage = value;
-                                  });
-                                }
-                              },
-                            ),
-                          ],
-                        ),
-                      ),
-                      SwitchListTile(
-                        title: const Text(
-                          'Enable Text-to-Speech for Responses',
-                        ),
-                        value: _enableTts,
-                        onChanged: (value) {
-                          setState(() {
-                            _enableTts = value;
-                          });
-                        },
-                      ),
-                    ],
-                  ),
-                  const SizedBox(height: 30),
-                  Expanded(
-                    child: _messages.isEmpty
-                        ? const Center(
-                            child: Text(
-                              'No recordings yet',
-                              style: TextStyle(color: Colors.grey),
-                            ),
-                          )
-                        : ListView.builder(
-                            controller: _scrollController,
-                            itemCount: _messages.length,
-                            itemBuilder: (context, index) {
-                              final message =
-                                  _messages[_messages.length - 1 - index];
-                              return ChatBubble(
-                                text: message.text,
-                                isResponse: message.isResponse,
-                                timestamp: message.timestamp,
-                              );
-                            },
-                          ),
-                  ),
-                  Padding(
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                    child: Row(
-                      mainAxisAlignment: MainAxisAlignment.center,
-                      children: [
-                        FloatingActionButton(
-                          onPressed: _isRecording
-                              ? _stopRecording
-                              : (_isRecorderReady ? _startRecording : null),
-                          backgroundColor: _isRecording
-                              ? Colors.red
-                              : (_isRecorderReady ? Colors.blue : Colors.grey),
-                          child: Icon(
-                            _isRecording ? Icons.stop : Icons.mic,
-                            color: Colors.white,
-                          ),
-                        ),
-                        const SizedBox(width: 20),
-                        if (_filePath != null && !_isRecording)
-                          FloatingActionButton(
-                            onPressed: _sendRecording,
-                            backgroundColor: Colors.green,
-                            child: const Icon(Icons.send, color: Colors.white),
-                          ),
-                      ],
+                  const Icon(Icons.mic, size: 80, color: Colors.red),
+                  Text(
+                    _formatDuration(_recordingDuration),
+                    style: const TextStyle(
+                      fontSize: 24,
+                      fontWeight: FontWeight.bold,
                     ),
                   ),
                 ],
               ),
+            )
+          else
+            const Icon(Icons.mic_none, size: 80, color: Colors.grey),
+
+          const SizedBox(height: 20),
+          Text(_status, style: const TextStyle(fontSize: 18)),
+
+          Padding(
+            padding: const EdgeInsets.all(16.0),
+            child: DropdownButton<String>(
+              value: _selectedLanguage,
+              items: _languages
+                  .map(
+                    (lang) => DropdownMenuItem(
+                      value: lang['code'],
+                      child: Text(lang['name']!),
+                    ),
+                  )
+                  .toList(),
+              onChanged: (value) =>
+                  setState(() => _selectedLanguage = value ?? 'lug'),
             ),
           ),
-          if (_showSidebar)
-            AnimatedPositioned(
-              duration: const Duration(milliseconds: 300),
-              left: 0,
-              top: 0,
-              bottom: 0,
-              width: sidebarWidth,
-              child: Container(
-                decoration: BoxDecoration(
-                  color: Theme.of(context).colorScheme.surface,
-                  boxShadow: [
-                    BoxShadow(
-                      color: Colors.black.withOpacity(0.2),
-                      blurRadius: 5,
-                      spreadRadius: 1,
-                    ),
-                  ],
+
+          SwitchListTile(
+            title: const Text('Enable Text-to-Speech'),
+            value: _enableTts,
+            onChanged: (value) => setState(() => _enableTts = value),
+          ),
+        ],
+      ),
+    );
+  }
+
+  Widget _buildHistoryView() {
+    return ListView.builder(
+      itemCount: _recordings.length,
+      itemBuilder: (context, index) {
+        final record = _recordings[index];
+        return ListTile(
+          leading: Icon(
+            record['status'] == 'uploaded' ? Icons.cloud_done : Icons.cloud_off,
+            color: record['status'] == 'uploaded'
+                ? Colors.green
+                : Colors.orange,
+          ),
+          title: Text(record['transcript']?.toString() ?? 'No transcript'),
+          subtitle: Text(
+            '${record['language']} • ${_formatCreatedAt(record['created_at'])}',
+          ),
+          trailing: Row(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              IconButton(
+                icon: const Icon(Icons.play_arrow),
+                onPressed: () => _playRecording(record['file_path'].toString()),
+              ),
+              if (record['status'] == 'pending')
+                IconButton(
+                  icon: const Icon(Icons.refresh),
+                  onPressed: () =>
+                      _processRecording(record['file_path'].toString()),
                 ),
-                child: Column(
-                  crossAxisAlignment: CrossAxisAlignment.start,
-                  children: [
-                    Padding(
-                      padding: const EdgeInsets.all(16),
-                      child: Row(
-                        children: [
-                          const Text(
-                            'Recording History',
-                            style: TextStyle(
-                              fontSize: 20,
-                              fontWeight: FontWeight.bold,
-                            ),
-                          ),
-                          const Spacer(),
-                          IconButton(
-                            icon: const Icon(Icons.close),
-                            onPressed: _toggleSidebar,
-                          ),
-                        ],
-                      ),
-                    ),
-                    const Divider(height: 1),
-                    Expanded(
-                      child: _messages.isEmpty
-                          ? const Center(
-                              child: Text(
-                                'No recordings yet',
-                                style: TextStyle(color: Colors.grey),
-                              ),
-                            )
-                          : ListView.builder(
-                              itemCount: _messages.length,
-                              itemBuilder: (context, index) {
-                                final message =
-                                    _messages[_messages.length - 1 - index];
-                                return ListTile(
-                                  leading: Container(
-                                    padding: const EdgeInsets.all(8),
-                                    decoration: BoxDecoration(
-                                      color: message.isResponse
-                                          ? Colors.green.withOpacity(0.2)
-                                          : Colors.blue.withOpacity(0.2),
-                                      shape: BoxShape.circle,
-                                    ),
-                                    child: Icon(
-                                      message.isResponse
-                                          ? Icons.reply
-                                          : Icons.mic,
-                                      color: message.isResponse
-                                          ? Colors.green
-                                          : Colors.blue,
-                                    ),
-                                  ),
-                                  title: Text(message.text),
-                                  subtitle: Text(
-                                    '${message.timestamp.hour}:${message.timestamp.minute.toString().padLeft(2, '0')}',
-                                  ),
-                                );
-                              },
-                            ),
-                    ),
-                  ],
-                ),
+            ],
+          ),
+        );
+      },
+    );
+  }
+
+  Widget _buildControls() {
+    return Padding(
+      padding: const EdgeInsets.all(16.0),
+      child: Row(
+        mainAxisAlignment: MainAxisAlignment.center,
+        children: [
+          FloatingActionButton(
+            onPressed: _isRecording ? _stopRecording : _startRecording,
+            backgroundColor: _isRecording ? Colors.red : Colors.blue,
+            child: Icon(_isRecording ? Icons.stop : Icons.mic),
+          ),
+          if (_filePath != null && !_isRecording)
+            Padding(
+              padding: const EdgeInsets.only(left: 16.0),
+              child: FloatingActionButton(
+                onPressed: () => _processRecording(_filePath!),
+                backgroundColor: Colors.green,
+                child: const Icon(Icons.send),
               ),
             ),
         ],
       ),
-      floatingActionButton: FloatingActionButton(
-        onPressed: _toggleSidebar,
-        backgroundColor: Theme.of(context).colorScheme.primary,
-        child: Icon(
-          _showSidebar ? Icons.close : Icons.history,
-          color: Colors.white,
-        ),
-      ),
     );
   }
-}
 
-class ChatMessage {
-  final String text;
-  final bool isResponse;
-  final DateTime timestamp;
-
-  ChatMessage({
-    required this.text,
-    required this.isResponse,
-    required this.timestamp,
-  });
-}
-
-class ChatBubble extends StatelessWidget {
-  final String text;
-  final bool isResponse;
-  final DateTime timestamp;
-
-  const ChatBubble({
-    super.key,
-    required this.text,
-    required this.isResponse,
-    required this.timestamp,
-  });
-
-  @override
-  Widget build(BuildContext context) {
-    return Align(
-      alignment: isResponse ? Alignment.centerLeft : Alignment.centerRight,
-      child: Container(
-        margin: const EdgeInsets.symmetric(vertical: 4, horizontal: 8),
-        padding: const EdgeInsets.all(12),
-        decoration: BoxDecoration(
-          color: isResponse
-              ? Colors.green.withOpacity(0.1)
-              : Colors.blue.withOpacity(0.1),
-          borderRadius: BorderRadius.circular(12),
-          border: Border.all(
-            color: isResponse ? Colors.green : Colors.blue,
-            width: 1,
-          ),
-        ),
-        child: Column(
-          crossAxisAlignment: CrossAxisAlignment.start,
-          children: [
-            Text(
-              text,
-              style: TextStyle(color: isResponse ? Colors.green : Colors.blue),
-            ),
-            const SizedBox(height: 4),
-            Text(
-              '${timestamp.hour}:${timestamp.minute.toString().padLeft(2, '0')}',
-              style: const TextStyle(fontSize: 10, color: Colors.grey),
-            ),
-          ],
-        ),
-      ),
-    );
+  String _formatCreatedAt(String? isoDate) {
+    if (isoDate == null) return '';
+    final date = DateTime.parse(isoDate);
+    return '${date.hour}:${date.minute.toString().padLeft(2, '0')}';
   }
 }

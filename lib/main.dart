@@ -1,7 +1,10 @@
+import 'package:chapkat/home_page.dart';
 import 'package:flutter/material.dart';
 import 'auth_wrapper.dart';
 
-void main() {
+void main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+  await initDatabase();
   runApp(const MyApp());
 }
 
@@ -13,7 +16,6 @@ class MyApp extends StatelessWidget {
     return const MaterialApp(
       debugShowCheckedModeBanner: false,
       home: AuthWrapper(),
-      // home: AuthWrapper(),
     );
   }
 }
